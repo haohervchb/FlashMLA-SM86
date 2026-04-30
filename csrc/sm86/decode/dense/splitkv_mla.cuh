@@ -197,9 +197,12 @@ void run_flash_splitkv_mla_kernel_cuda_core(DenseAttnDecodeParams &params) {
 
 template<typename InputT>
 void run_flash_splitkv_mla_kernel(DenseAttnDecodeParams &params) {
-    // Use CUDA-core kernel (stable, all tests pass)
-    // Tensor-core kernel is available in splitkv_mla_tc.cuh under tc:: namespace
+#ifdef FLASH_MLA_USE_TENSOR_CORE
+    tc::run_flash_splitkv_mla_kernel<InputT>(params);
+#else
+    // tc::debug_test<InputT>(params);  // uncomment to test debug kernel
     run_flash_splitkv_mla_kernel_cuda_core<InputT>(params);
+#endif
 }
 
 }
