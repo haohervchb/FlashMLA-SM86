@@ -77,20 +77,45 @@ flash_fwd_splitkv_mla_fp8_sparse_kernel(const SparseAttnDecodeParams params) {
                         dot += (float)q_row[512 + k] * kv_val;
                     }
                 } else {
-                    // MODEL1: 448 fp8 + 64*2 rope + 8 scales = 584, padded to 576
+                    // MODEL1: 448 fp8 nope + 64 bf16 rope + 8 scale bytes per token = 576 bytes
+                    // Scales are fp8_e8m0 stored in bytes 8-14 of each token's last 8 bytes
+                    // Each scale covers 64 nope elements. 7 scales for 448 elements.
                     bytes_per_token = 576;
                     const uint8_t* fp8_tok = ((const uint8_t*)params.kv) + block_id * params.stride_kv_block + offset * bytes_per_token;
+                    
+                    // Read scales from token (bytes 448+128 = 576... wait, layout is:
+                    // [448 fp8 nope] [64 bf16 rope x 2 = 128 bytes] = total 576
+                    // Scales are stored INTERLEAVED or at end? 
+                    // Looking at quant.py: result_k_scale_factor at end of block, not per-token
+                    // For MODEL1, scales are at end of PAGE BLOCK, not per token!
+                    // Simplified for now: use per-tile scales stored like V32 but with fp8_e8m0
+                    // Actually the MODEL1 layout from the original code:
+                    //   block = [tokens] [scales per page]
+                    // Each token: 448 fp8 + 64 bf16 * 2 = 448 + 128 = 576 bytes
+                    // Scales area: at end of block: block_size * NUM_SCALES bytes
+                    // For MODEL1: NUM_SCALES = 8, each scale is 1 byte fp8_e8m0
+                    
+                    // Read scales from end of block
+                    #define MODEL1_NUM_SCALES 8
+                    const uint8_t* scale_area = ((const uint8_t*)params.kv) 
+                        + block_id * params.stride_kv_block 
+                        + params.page_block_size * 576;  // skip all tokens
+                    // scales for token `offset`: scale_area + offset * MODEL1_NUM_SCALES
+                    const uint8_t* token_scales = scale_area + offset * MODEL1_NUM_SCALES;
+                    
                     for (int k = 0; k < 448; ++k) {
                         int tile = k / 64;
-                        // MODEL1 uses fp8_e8m0 scales stored differently
-                        // Simplified: use 1.0 scale for MODEL1
-                        float kv_val = (float)((const cutlass::float_e4m3_t*)(fp8_tok))[k];
+                        // fp8_e8m0 scale: the byte value represents 2^(value-127)
+                        uint8_t scale_byte = token_scales[tile];
+                        float scale = (scale_byte == 0) ? 1.0f : exp2f((int)scale_byte - 127.0f);
+                        float kv_val = (float)((const cutlass::float_e4m3_t*)(fp8_tok))[k] * scale;
                         dot += (float)q_row[k] * kv_val;
                     }
                     for (int k = 0; k < 64; ++k) {
                         float kv_val = (float)((const bf16*)(fp8_tok + 448))[k];
                         dot += (float)q_row[448 + k] * kv_val;
                     }
+                    #undef MODEL1_NUM_SCALES
                 }
                 dot *= params.sm_scale_div_log2;
 
@@ -106,12 +131,29 @@ flash_fwd_splitkv_mla_fp8_sparse_kernel(const SparseAttnDecodeParams params) {
                 running_sum += pn;
 
                 // PV: O += P @ V
-                const uint8_t* fp8_tok = ((const uint8_t*)params.kv) + block_id * params.stride_kv_block + offset * bytes_per_token;
-                for (int c = 0; c < 512; ++c) {
-                    int tile = c / 128;
-                    float scale = MODEL_TYPE == ModelType::V32 ? ((const float*)(fp8_tok + 512))[tile] : 1.0f;
-                    float kv_val = (float)((const cutlass::float_e4m3_t*)(fp8_tok))[c] * scale;
-                    o_acc[c] += pn * kv_val;
+                if (MODEL_TYPE == ModelType::V32) {
+                    const uint8_t* fp8_tok_v = ((const uint8_t*)params.kv) + block_id * params.stride_kv_block + offset * 656;
+                    for (int c = 0; c < 512; ++c) {
+                        int tile = c / 128;
+                        float scale = ((const float*)(fp8_tok_v + 512))[tile];
+                        float kv_val = (float)((const cutlass::float_e4m3_t*)(fp8_tok_v))[c] * scale;
+                        o_acc[c] += pn * kv_val;
+                    }
+                } else {
+                    // MODEL1: V columns 0-447 are fp8 nope, 448-511 are bf16 rope
+                    const uint8_t* fp8_tok_v = ((const uint8_t*)params.kv) + block_id * params.stride_kv_block + offset * 576;
+                    const uint8_t* sc_v = ((const uint8_t*)params.kv) + block_id * params.stride_kv_block + params.page_block_size * 576 + offset * 8;
+                    for (int c = 0; c < 448; ++c) {
+                        int tile = c / 64;
+                        uint8_t sb = sc_v[tile];
+                        float scale = (sb == 0) ? 1.0f : exp2f((int)sb - 127.0f);
+                        float kv_val = (float)((const cutlass::float_e4m3_t*)(fp8_tok_v))[c] * scale;
+                        o_acc[c] += pn * kv_val;
+                    }
+                    for (int c = 448; c < 512; ++c) {
+                        float kv_val = (float)((const bf16*)(fp8_tok_v + 448))[c - 448];
+                        o_acc[c] += pn * kv_val;
+                    }
                 }
             }
         }
