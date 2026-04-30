@@ -4,9 +4,14 @@
 
 #include "params.h"
 
+#ifdef FLASH_MLA_HAS_SM90
 #include "sm90/decode/sparse_fp8/splitkv_mla.h"
+#endif
+#include "sm86/decode/sparse_fp8/splitkv_mla.h"
+#ifdef FLASH_MLA_HAS_SM100
 #include "sm100/decode/head64/kernel.h"
 #include "sm100/prefill/sparse/fwd_for_small_topk/head128/phase1.h"
+#endif
 #include "smxx/decode/get_decoding_sched_meta/get_decoding_sched_meta.h"
 #include "smxx/decode/combine/combine.h"
 
@@ -41,6 +46,7 @@ public:
     virtual DecodeImplMeta get_meta(int h_q, int s_q) = 0;
 };
 
+#ifdef FLASH_MLA_HAS_SM90
 class Decode_Sm90_Impl : public DecodeImplBase {
     DECLARE_SUPPORTED_FEATURES(
         DecodeFeatures::HEAD_64,
@@ -75,6 +81,43 @@ protected:
     }
 };
 
+#endif // FLASH_MLA_HAS_SM90
+
+class Decode_Sm86_Impl : public DecodeImplBase {
+    DECLARE_SUPPORTED_FEATURES(
+        DecodeFeatures::HEAD_64,
+        DecodeFeatures::HEAD_128,
+        DecodeFeatures::HEAD_DIM_512,
+        DecodeFeatures::HEAD_DIM_576,
+        DecodeFeatures::V32_KVCACHE_FORMAT,
+        DecodeFeatures::MODEL1_KVCACHE_FORMAT,
+        DecodeFeatures::ATTN_SINK,
+        DecodeFeatures::TOPK_LENGTH,
+        DecodeFeatures::EXTRA_KVCACHE,
+        DecodeFeatures::EXTRA_TOPK_LENGTH
+    )
+
+public:
+    DecodeImplMeta get_meta(int h_q, int s_q) override {
+        Arch arch = Arch();
+        return {
+            std::max(arch.num_sms / s_q / ((h_q+15)/16), 1),
+            5,
+            64
+        };
+    }
+
+protected:
+    void run_(const SparseAttnDecodeParams &params, const std::vector<FeatureT> &required_features) override {
+        DISPATCH_MODEL_TYPE(params.model_type, MODEL_TYPE, [&]() {
+            DISPATCH_NUM_HEADS(params.h_q, NUM_HEADS, [&]() {
+                sm86::decode::run_flash_splitkv_mla_fp8_sparse_kernel<MODEL_TYPE, NUM_HEADS>(params);
+            });
+        });
+    }
+};
+
+#ifdef FLASH_MLA_HAS_SM100
 class Decode_Sm100_Head64_Impl : public DecodeImplBase {
     DECLARE_SUPPORTED_FEATURES(
         DecodeFeatures::HEAD_64,
@@ -179,6 +222,8 @@ protected:
         sm100::fwd_for_small_topk::head128::run_fwd_for_small_topk_phase1_kernel<SparseAttnFwdMode::DecodeWithSplitKV, 512>(params);
     }
 };
+
+#endif // FLASH_MLA_HAS_SM100
 
 static std::tuple<at::Tensor, at::Tensor, std::optional<at::Tensor>, std::optional<at::Tensor>>
 sparse_attn_decode_interface(
@@ -361,6 +406,7 @@ sparse_attn_decode_interface(
 
     DecodeImplBase* impl;
     if (arch.is_sm100f()) {
+#ifdef FLASH_MLA_HAS_SM100
         if (h_q == 64) {
             impl = new Decode_Sm100_Head64_Impl();
         } else if (h_q == 128) {
@@ -374,8 +420,15 @@ sparse_attn_decode_interface(
         } else {
             TORCH_CHECK(false, "Unsupported h_q: ", h_q);
         }
+#endif // FLASH_MLA_HAS_SM100
     } else if (arch.is_sm90a()) {
+#ifdef FLASH_MLA_HAS_SM90
         impl = new Decode_Sm90_Impl();
+#else
+        TORCH_CHECK(false, "SM90 sparse decode not compiled");
+#endif
+    } else if (arch.is_sm80()) {
+        impl = new Decode_Sm86_Impl();
     } else {
         TORCH_CHECK(false, "Unsupported architecture for sparse decode fwd");
     }
