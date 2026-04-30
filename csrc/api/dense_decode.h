@@ -85,7 +85,7 @@ dense_attn_decode_interface(
     const int num_heads = num_heads_k;
     q = q.view({batch_size, seqlen_q_ori, num_heads_k, num_q_heads_per_hk, head_size_k}).transpose(2, 3)
         .reshape({batch_size, q_seq_per_hk, num_heads, head_size_k});
-    int num_sm_parts = std::max(arch.num_sms / num_heads_k / cutlass::ceil_div(seqlen_q_ori*num_heads_q/num_heads_k, 64), 1);
+    int num_sm_parts = std::max(arch.num_sms / num_heads_k / cutlass::ceil_div(seqlen_q_ori*num_heads_q/num_heads_k, arch.is_sm86() ? 16 : 64), 1);
 
     KU_CHECK_SHAPE(q, batch_size, q_seq_per_hk, num_heads, head_size_k);
     KU_CHECK_SHAPE(kcache, num_blocks, page_block_size, num_heads_k, head_size_k);

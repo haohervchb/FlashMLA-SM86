@@ -176,8 +176,11 @@ flash_fwd_splitkv_mla_kernel(const DenseAttnDecodeParams params) {
     }
 }
 
+// Include tensor-core kernel
+#include "splitkv_mla_tc.cuh"
+
 template<typename InputT>
-void run_flash_splitkv_mla_kernel(DenseAttnDecodeParams &params) {
+void run_flash_splitkv_mla_kernel_cuda_core(DenseAttnDecodeParams &params) {
     constexpr size_t smem_size = 
         BLK_M * HD_K * sizeof(InputT) +      // sQ
         BLK_N * HD_K * sizeof(InputT) +      // sK
@@ -190,6 +193,13 @@ void run_flash_splitkv_mla_kernel(DenseAttnDecodeParams &params) {
     dim3 block(NUM_THREADS);
     mla_kernel<<<grid, block, smem_size, params.stream>>>(params);
     CHECK_CUDA_KERNEL_LAUNCH();
+}
+
+template<typename InputT>
+void run_flash_splitkv_mla_kernel(DenseAttnDecodeParams &params) {
+    // Use CUDA-core kernel (stable, all tests pass)
+    // Tensor-core kernel is available in splitkv_mla_tc.cuh under tc:: namespace
+    run_flash_splitkv_mla_kernel_cuda_core<InputT>(params);
 }
 
 }
