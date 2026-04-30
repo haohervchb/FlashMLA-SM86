@@ -59,7 +59,7 @@ flash_fwd_splitkv_mla_fp8_sparse_kernel(const SparseAttnDecodeParams params) {
             if (valid) {
                 // FP8 dequant on-the-fly + dot product with Q
                 float dot = 0.0f;
-                const bf16* q_row = params.q + (m_block_idx * BLK_M + my_row) * params.stride_q_h_q;
+                const bf16* q_row = params.q + bi * params.stride_q_b + (m_block_idx * BLK_M + my_row) * params.stride_q_h_q;
                 
                 // NOPE: fp8 -> bf16 via per-tile float32 scales
                 int bytes_per_token;
