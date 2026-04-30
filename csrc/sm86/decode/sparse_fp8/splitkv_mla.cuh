@@ -86,7 +86,7 @@ flash_fwd_sparse_decode_mla_kernel(const SparseAttnDecodeParams params) {
                 float P[BLK_N];
                 float cur_max = -1e33f;
                 for (int ni = 0; ni < this_tk; ++ni) {
-                    int idx = __ldg(idx_base + bi * params.stride_indices_b / sizeof(int) + tk_start + ni);
+                    int idx = __ldg(idx_base + tk_start + ni);
                     if (idx < 0) { P[ni] = -1e33f; continue; }
                     int block_id = idx / params.page_block_size;
                     int offset = idx % params.page_block_size;
@@ -134,7 +134,7 @@ flash_fwd_sparse_decode_mla_kernel(const SparseAttnDecodeParams params) {
                 // PV
                 for (int ni = 0; ni < this_tk; ++ni) {
                     float pn = P[ni]; if (pn == 0.0f) continue;
-                    int idx = __ldg(idx_base + bi * params.stride_indices_b / sizeof(int) + tk_start + ni);
+                    int idx = __ldg(idx_base + tk_start + ni);
                     if (idx < 0) continue;
                     int block_id = idx / params.page_block_size;
                     int offset = idx % params.page_block_size;
@@ -174,17 +174,20 @@ flash_fwd_sparse_decode_mla_kernel(const SparseAttnDecodeParams params) {
 }
 
 // Host launch
-void run_sparse_decode_fwd_kernel(SparseAttnDecodeParams &params) {
-    constexpr int BLK_M = 16, BLK_N = 64, HD_K = 576, HD_V = 512;
-    const int num_m_block = (params.h_q + BLK_M - 1) / BLK_M;
-    auto kernel = &flash_fwd_sparse_decode_mla_kernel<BLK_M, BLK_N, HD_K, HD_V, true>;
-    // Try both with and without attn_sink
-    if (params.attn_sink == nullptr) {
-        auto kernel_ns = &flash_fwd_sparse_decode_mla_kernel<BLK_M, BLK_N, HD_K, HD_V, false>;
-        kernel_ns<<<dim3(num_m_block, 1, params.num_sm_parts), dim3(128), 0, params.stream>>>(params);
-    } else {
-        kernel<<<dim3(num_m_block, 1, params.num_sm_parts), dim3(128), 0, params.stream>>>(params);
+__global__ void sparse_decode_debug(const SparseAttnDecodeParams p) {
+    int mbi = blockIdx.x, tid = threadIdx.x;
+    int my_row = tid % 16, g_row = mbi * 16 + my_row;
+    if (g_row < p.h_q) {
+        for (int c = 0; c < 512; ++c)
+            p.out[mbi * 16 * p.stride_o_h_q + my_row * p.stride_o_h_q + c] = bf16(0.0f);
+        p.lse[mbi * 16 + my_row] = 0.0f;
     }
+}
+
+void run_sparse_decode_fwd_kernel(SparseAttnDecodeParams &params) {
+    constexpr int BLK_M = 16;
+    const int num_m_block = (params.h_q + BLK_M - 1) / BLK_M;
+    sparse_decode_debug<<<dim3(num_m_block, 1, params.num_sm_parts), dim3(128), 0, params.stream>>>(params);
     CHECK_CUDA_KERNEL_LAUNCH();
 }
 
