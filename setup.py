@@ -81,6 +81,7 @@ if not is_flag_set("FLASH_MLA_DISABLE_SM86"):
         "csrc/sm86/decode/dense/instantiations/fp16.cu",
         "csrc/sm86/prefill/sparse/instantiations/hd576.cu",
         "csrc/sm86/prefill/sparse/instantiations/hd512.cu",
+        "csrc/sm86/decode/sparse_fp8/fwd.cu",
     ]
 
 if not is_flag_set("FLASH_MLA_DISABLE_SM90"):
