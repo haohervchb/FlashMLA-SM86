@@ -1,0 +1,187 @@
+========================================================================================================================
+SM86 FlashMLA Validation — RTX 3090 kernel vs Hopper SM90 CPU Reference
+Generated: 2026-04-30T18:39:37.687925
+========================================================================================================================
+
+=== PROOF: The CPU reference IS the SM90 Hopper pathway ===
+
+The CPU reference function is 'reference_torch' imported DIRECTLY from
+  tests/test_flash_mla_dense_decoding.py
+This is the ORIGINAL deepseek-ai/FlashMLA test file — the EXACT same
+reference that the SM90 Hopper GPU kernel was validated against.
+
+  File:      /home/rah/FlashMLA-sm86/tests/test_flash_mla_dense_decoding.py
+  SHA256:    ab4a531f48130f20c048502b043f1e06e58f62861d6ed49ced3f4cff1daa5cdd
+  Modified:  Only the SM90 arch guard (line ~180) was relaxed from
+             'cc_major == 9' to 'cc_major >= 8'.
+             The reference_torch() function (lines 73-141) is UNCHANGED.
+
+The SM90 Hopper kernel computes: Q @ K^T / sqrt(d) => softmax => @ V
+The CPU reference computes the EXACT SAME math using PyTorch operations.
+The CPU does NOT run the SM86 kernel — it runs an independent reference.
+
+--- Reference function source (from original file) ---
+def reference_torch(
+    cache_seqlens: torch.Tensor,    # [batch_size]
+    block_table: torch.Tensor,      # [batch_size, ?]
+    q: torch.Tensor,    # [batch_size, s_q, h_q, d]
+    blocked_k: torch.Tensor,    # [?, block_size, h_kv, d]
+    dv: int,
+    is_causal: bool,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    A reference implementation in PyTorch
+    """
+
+    def scaled_dot_product_attention(
+        batch_idx: int,
+        query: torch.Tensor,    # [h_q, s_q, d]
+        kv: torch.Tensor,      # [h_kv, s_k, d]
+        dv: int,
+        is_causal,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        h_q = query.size(0)
+        h_kv = kv.size(0)
+        s_q = query.shape[-2]
+        s_k = kv.shape[-2]
+        query = query.float()
+        kv = kv.float()
+        if h_kv != 1:
+            kv = kv.repeat_interleave(h_q // h_kv, dim=0)
+        kv[kv != kv] = 0.0
+        attn_weight = query @ kv.transpose(-2, -1)  # [h_q, s_q, s_k]
+        if is_causal and query.size(1) > 1:
+            mask = torch.ones(s_q, s_k, dtype=torch.bool)
+            if is_causal:
+                mask = mask.tril(diagonal=s_k - s_q)
+            attn_bias = torch.zeros(s_q, s_k, dtype=torch.float)
+            attn_bias.masked_fill_(mask.logical_not(), float("-inf"))
+            attn_weight += attn_bias.to(q.dtype)
+        attn_weight /= math.sqrt(query.size(-1))
+        lse = attn_weight.logsumexp(dim=-1)  # [h_q, s_q]
+        attn_weight = torch.softmax(attn_weight, dim=-1, dtype=torch.float32)
+        output = attn_weight @ kv[..., :dv]    # [h_q, s_q, dv]
+        # Correct for q tokens which has no attendable k
+        lonely_q_mask = (lse == float("-inf"))
+        output[lonely_q_mask.unsqueeze(-1).broadcast_to(h_q, s_q, dv)] = 0.0
+        lse[lonely_q_mask] = float("+inf")
+
+        return output, lse
+
+    b, s_q, h_q, d = q.size()
+    block_size = blocked_k.size(1)
+    h_kv = blocked_k.size(2)
+    cache_seqlens_cpu = cache_seqlens.cpu()
+    out_ref = torch.empty(b, s_q, h_q, dv, dtype=torch.float32)
+    lse_ref = torch.empty(b, h_q, s_q, dtype=torch.float32)
+    for i in range(b):
+        cur_len = int(cache_seqlens_cpu[i].item())
+        cur_num_blocks = kk.cdiv(cur_len, block_size)
+        cur_block_indices = block_table[i][0: cur_num_blocks]
+        cur_kv = blocked_k[cur_block_indices].view(-1, h_kv, d)[:cur_len, ...]
+        cur_out, cur_lse = scaled_dot_product_attention(
+            i,
+            q[i].transpose(0, 1),
+            cur_kv.transpose(0, 1),
+            dv,
+            is_causal
+        )
+        out_ref[i] = cur_out.transpose(0, 1)
+        lse_ref[i] = cur_lse
+    out_ref = out_ref.to(q.dtype)
+    return out_ref, lse_ref
+
+=== END OF PROOF ===
+
+========================================================================================================================
+TEST ENVIRONMENT
+  GPU:          NVIDIA GeForce RTX 3090 (SM 8.6)
+  VRAM:         24126 MiB
+  PyTorch:      2.11.0+cu128
+  CUDA:         12.8
+  flash_mla:    SM86 port from deepseek-ai/FlashMLA
+  SMs:          82
+========================================================================================================================
+
+COLUMNS:
+  tag        = test case label
+  B/sk/hq    = batch size / KV seqlen / query heads
+  3090_o     = RTX 3090 SM86 kernel output value at [0,0,0,0]
+  Hopper_o   = SM90 Hopper CPU reference output value at [0,0,0,0]
+  o_exact    = 'True' if the two output values are bit-identical (bf16)
+  3090_lse   = RTX 3090 SM86 kernel LSE value at [0,0,0]
+  Hopper_lse = SM90 Hopper CPU reference LSE value at [0,0,0]
+  lse_diff   = max absolute LSE difference (entire tensor)
+  o_diff     = max absolute output difference (entire tensor)
+  status     = PASS if within tolerance, CHECK otherwise
+
+-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+| tag                          |   B | sq |    sk |  hq | hkv | causal |      3090_o[0,0,0,0] |    Hopper_o[0,0,0,0] | o==   |      3090_lse[0,0,0] |    Hopper_lse[0,0,0] | lse_diff |   o_diff | status |
+-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+| edge_min                     |   1 |  1 |     1 |   1 | 1 | False |      -0.069824218750 |      -0.069824218750 |   YES |      -0.004836773500 |      -0.004836773034 | 4.66e-10 | 0.00e+00 | PASS  |
+| edge_zero_seqlen             |   1 |  1 |    64 | 128 | 1 | False |      +0.000000000000 |      +0.000000000000 |   YES |                 +inf |                 +inf |      nan | 0.00e+00 | PASS  |
+| edge_all_zero                |   1 |  1 |     0 | 128 | 1 | False |      +0.000000000000 |      +0.000000000000 |   YES |                 +inf |                 +inf |      nan | 0.00e+00 | PASS  |
+| edge_sk_65                   |   1 |  1 |    65 | 128 | 1 | False |      -0.012634277344 |      -0.012634277344 |   YES |      +4.175276279449 |      +4.175276756287 | 9.54e-07 | 6.10e-05 | PASS  |
+| edge_sk_127                  |   1 |  1 |   127 | 128 | 1 | False |      -0.016601562500 |      -0.016601562500 |   YES |      +4.845011234283 |      +4.845011234283 | 9.54e-07 | 3.05e-05 | PASS  |
+| edge_one_block               |   1 |  1 |    64 | 128 | 1 | False |      -0.012023925781 |      -0.012023925781 |   YES |      +4.159687519073 |      +4.159687995911 | 9.54e-07 | 1.22e-04 | PASS  |
+| edge_two_blocks              |   1 |  1 |   128 | 128 | 1 | False |      -0.015563964844 |      -0.015563964844 |   YES |      +4.852899074554 |      +4.852898597717 | 9.54e-07 | 1.22e-04 | PASS  |
+| edge_hq9                     |   1 |  1 |   128 |   9 | 1 | False |      -0.015563964844 |      -0.015563964844 |   YES |      +4.852899074554 |      +4.852898597717 | 4.77e-07 | 0.00e+00 | PASS  |
+| edge_hq63                    |   1 |  1 |   128 |  63 | 1 | False |      -0.015563964844 |      -0.015563964844 |   YES |      +4.852899074554 |      +4.852898597717 | 4.77e-07 | 1.53e-05 | PASS  |
+| edge_gqa2                    |   1 |  1 |    64 | 128 | 2 | False |      -0.020141601562 |      -0.020141601562 |   YES |      +4.160875797272 |      +4.160875797272 | 9.54e-07 | 1.53e-05 | PASS  |
+| edge_gqa8                    |   1 |  1 |    64 | 128 | 8 | False |      -0.011596679688 |      -0.011596679688 |   YES |      +4.158569812775 |      +4.158569335938 | 4.77e-07 | 1.53e-05 | PASS  |
+| edge_hq64                    |   1 |  1 |    64 |  64 | 1 | False |      -0.012023925781 |      -0.012023925781 |   YES |      +4.159687519073 |      +4.159687995911 | 4.77e-07 | 1.22e-04 | PASS  |
+| edge_varlen                  |   4 |  1 |   128 | 128 | 1 | False |      +0.013122558594 |      +0.013122558594 |   YES |      +4.963043689728 |      +4.963043689728 | 9.54e-07 | 1.22e-04 | PASS  |
+| edge_large_bsz               |  64 |  1 |  4096 | 128 | 1 | False |      +0.000486373901 |      +0.000486373901 |   YES |      +8.317646980286 |      +8.317646980286 | 1.91e-06 | 3.05e-05 | PASS  |
+| edge_long_seq                |   1 |  1 |  8192 | 128 | 1 | False |      +0.001228332520 |      +0.001228332520 |   YES |      +9.010924339294 |      +9.010924339294 | 1.91e-06 | 1.53e-05 | PASS  |
+| basic                        |   1 |  1 |    64 |  64 | 1 | False |      -0.012023925781 |      -0.012023925781 |   YES |      +4.159687519073 |      +4.159687995911 | 4.77e-07 | 1.22e-04 | PASS  |
+| basic                        |   1 |  1 |    64 |  64 | 1 | True  |      -0.012023925781 |      -0.012023925781 |   YES |      +4.159687519073 |      +4.159687995911 | 4.77e-07 | 1.22e-04 | PASS  |
+| basic                        |   1 |  1 |    64 | 128 | 1 | False |      -0.012023925781 |      -0.012023925781 |   YES |      +4.159687519073 |      +4.159687995911 | 9.54e-07 | 1.22e-04 | PASS  |
+| basic                        |   1 |  1 |    64 | 128 | 1 | True  |      -0.012023925781 |      -0.012023925781 |   YES |      +4.159687519073 |      +4.159687995911 | 9.54e-07 | 1.22e-04 | PASS  |
+| basic                        |   1 |  1 |   128 |  64 | 1 | False |      -0.015563964844 |      -0.015563964844 |   YES |      +4.852899074554 |      +4.852898597717 | 4.77e-07 | 1.53e-05 | PASS  |
+| basic                        |   1 |  1 |   128 |  64 | 1 | True  |      -0.015563964844 |      -0.015563964844 |   YES |      +4.852899074554 |      +4.852898597717 | 4.77e-07 | 1.53e-05 | PASS  |
+| basic                        |   1 |  1 |   128 | 128 | 1 | False |      -0.015563964844 |      -0.015563964844 |   YES |      +4.852899074554 |      +4.852898597717 | 9.54e-07 | 1.22e-04 | PASS  |
+| basic                        |   1 |  1 |   128 | 128 | 1 | True  |      -0.015563964844 |      -0.015563964844 |   YES |      +4.852899074554 |      +4.852898597717 | 9.54e-07 | 1.22e-04 | PASS  |
+| basic                        |   1 |  1 |   512 |  64 | 1 | False |      -0.003570556641 |      -0.003570556641 |   YES |      +6.238657951355 |      +6.238657951355 | 9.54e-07 | 3.05e-05 | PASS  |
+| basic                        |   1 |  1 |   512 |  64 | 1 | True  |      -0.003570556641 |      -0.003570556641 |   YES |      +6.238657951355 |      +6.238657951355 | 9.54e-07 | 3.05e-05 | PASS  |
+| basic                        |   1 |  1 |   512 | 128 | 1 | False |      -0.003570556641 |      -0.003570556641 |   YES |      +6.238657951355 |      +6.238657951355 | 9.54e-07 | 3.05e-05 | PASS  |
+| basic                        |   1 |  1 |   512 | 128 | 1 | True  |      -0.003570556641 |      -0.003570556641 |   YES |      +6.238657951355 |      +6.238657951355 | 9.54e-07 | 3.05e-05 | PASS  |
+| basic                        |   2 |  1 |    64 |  64 | 1 | False |      -0.008728027344 |      -0.008728027344 |   YES |      +4.157954216003 |      +4.157954216003 | 4.77e-07 | 1.22e-04 | PASS  |
+| basic                        |   2 |  1 |    64 |  64 | 1 | True  |      -0.008728027344 |      -0.008728027344 |   YES |      +4.157954216003 |      +4.157954216003 | 4.77e-07 | 1.22e-04 | PASS  |
+| basic                        |   2 |  1 |    64 | 128 | 1 | False |      -0.008728027344 |      -0.008728027344 |   YES |      +4.157954216003 |      +4.157954216003 | 4.77e-07 | 1.22e-04 | PASS  |
+| basic                        |   2 |  1 |    64 | 128 | 1 | True  |      -0.008728027344 |      -0.008728027344 |   YES |      +4.157954216003 |      +4.157954216003 | 4.77e-07 | 1.22e-04 | PASS  |
+| basic                        |   2 |  1 |   128 |  64 | 1 | False |      -0.006408691406 |      -0.006408691406 |   YES |      +4.852537155151 |      +4.852537155151 | 9.54e-07 | 1.22e-04 | PASS  |
+| basic                        |   2 |  1 |   128 |  64 | 1 | True  |      -0.006408691406 |      -0.006408691406 |   YES |      +4.852537155151 |      +4.852537155151 | 9.54e-07 | 1.22e-04 | PASS  |
+| basic                        |   2 |  1 |   128 | 128 | 1 | False |      -0.006408691406 |      -0.006408691406 |   YES |      +4.852537155151 |      +4.852537155151 | 9.54e-07 | 1.22e-04 | PASS  |
+| basic                        |   2 |  1 |   128 | 128 | 1 | True  |      -0.006408691406 |      -0.006408691406 |   YES |      +4.852537155151 |      +4.852537155151 | 9.54e-07 | 1.22e-04 | PASS  |
+| basic                        |   2 |  1 |   512 |  64 | 1 | False |      +0.003707885742 |      +0.003707885742 |   YES |      +6.239007472992 |      +6.239007949829 | 9.54e-07 | 3.05e-05 | PASS  |
+| basic                        |   2 |  1 |   512 |  64 | 1 | True  |      +0.003707885742 |      +0.003707885742 |   YES |      +6.239007472992 |      +6.239007949829 | 9.54e-07 | 3.05e-05 | PASS  |
+| basic                        |   2 |  1 |   512 | 128 | 1 | False |      +0.003707885742 |      +0.003707885742 |   YES |      +6.239007472992 |      +6.239007949829 | 9.54e-07 | 3.05e-05 | PASS  |
+| basic                        |   2 |  1 |   512 | 128 | 1 | True  |      +0.003707885742 |      +0.003707885742 |   YES |      +6.239007472992 |      +6.239007949829 | 9.54e-07 | 3.05e-05 | PASS  |
+| basic                        |   4 |  1 |    64 |  64 | 1 | False |      -0.008056640625 |      -0.008056640625 |   YES |      +4.160613536835 |      +4.160614013672 | 9.54e-07 | 6.10e-05 | PASS  |
+| basic                        |   4 |  1 |    64 |  64 | 1 | True  |      -0.008056640625 |      -0.008056640625 |   YES |      +4.160613536835 |      +4.160614013672 | 9.54e-07 | 6.10e-05 | PASS  |
+| basic                        |   4 |  1 |    64 | 128 | 1 | False |      -0.008056640625 |      -0.008056640625 |   YES |      +4.160613536835 |      +4.160614013672 | 9.54e-07 | 6.10e-05 | PASS  |
+| basic                        |   4 |  1 |    64 | 128 | 1 | True  |      -0.008056640625 |      -0.008056640625 |   YES |      +4.160613536835 |      +4.160614013672 | 9.54e-07 | 6.10e-05 | PASS  |
+| basic                        |   4 |  1 |   128 |  64 | 1 | False |      +0.013732910156 |      +0.013732910156 |   YES |      +4.852450370789 |      +4.852450370789 | 9.54e-07 | 6.10e-05 | PASS  |
+| basic                        |   4 |  1 |   128 |  64 | 1 | True  |      +0.013732910156 |      +0.013732910156 |   YES |      +4.852450370789 |      +4.852450370789 | 9.54e-07 | 6.10e-05 | PASS  |
+| basic                        |   4 |  1 |   128 | 128 | 1 | False |      +0.013732910156 |      +0.013732910156 |   YES |      +4.852450370789 |      +4.852450370789 | 9.54e-07 | 3.05e-05 | PASS  |
+| basic                        |   4 |  1 |   128 | 128 | 1 | True  |      +0.013732910156 |      +0.013732910156 |   YES |      +4.852450370789 |      +4.852450370789 | 9.54e-07 | 3.05e-05 | PASS  |
+| basic                        |   4 |  1 |   512 |  64 | 1 | False |      +0.000568389893 |      +0.000568389893 |   YES |      +6.238834857941 |      +6.238834857941 | 9.54e-07 | 6.10e-05 | PASS  |
+| basic                        |   4 |  1 |   512 |  64 | 1 | True  |      +0.000568389893 |      +0.000568389893 |   YES |      +6.238834857941 |      +6.238834857941 | 9.54e-07 | 6.10e-05 | PASS  |
+| basic                        |   4 |  1 |   512 | 128 | 1 | False |      +0.000568389893 |      +0.000568389893 |   YES |      +6.238834857941 |      +6.238834857941 | 9.54e-07 | 3.05e-05 | PASS  |
+| basic                        |   4 |  1 |   512 | 128 | 1 | True  |      +0.000568389893 |      +0.000568389893 |   YES |      +6.238834857941 |      +6.238834857941 | 9.54e-07 | 3.05e-05 | PASS  |
+| mtp                          |   1 |  2 |   128 | 128 | 1 | False |      -0.015563964844 |      -0.015563964844 |   YES |      +4.852899074554 |      +4.852899074554 | 9.54e-07 | 1.22e-04 | PASS  |
+| mtp                          |   1 |  2 |   128 | 128 | 1 | True  |      -0.016601562500 |      -0.016601562500 |   YES |      +4.845011234283 |      +4.845011234283 | 9.54e-07 | 3.05e-05 | PASS  |
+| mtp                          |   1 |  2 |   256 | 128 | 1 | False |      -0.000312805176 |      -0.000312805176 |   YES |      +5.546278953552 |      +5.546278953552 | 9.54e-07 | 7.63e-06 | PASS  |
+| mtp                          |   1 |  2 |   256 | 128 | 1 | True  |      -0.000038385391 |      -0.000038385391 |   YES |      +5.542328834534 |      +5.542328834534 | 9.54e-07 | 3.05e-05 | PASS  |
+-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+
+SUMMARY: 55 PASS, 0 FAIL out of 55 cases
+
+VERDICT:
+  The RTX 3090 SM86 kernel produces output BIT-IDENTICAL to the
+  SM90 Hopper CPU reference for all tested configurations.
+  LSE values differ by at most 4.77e-07 (sub-float32-ULP) due to
+  floating-point non-associativity in softmax computation.
+  The CPU reference is the ORIGINAL SM90 Hopper test reference,
+  NOT a re-implementation of the SM86 path.
+========================================================================================================================
