@@ -4,10 +4,15 @@
 
 #include "params.h"
 
+#ifdef FLASH_MLA_HAS_SM90
 #include "sm90/prefill/sparse/phase1.h"
+#endif
+#include "sm86/prefill/sparse/fwd.h"
+#ifdef FLASH_MLA_HAS_SM100
 #include "sm100/prefill/sparse/fwd/head128/phase1.h"
 #include "sm100/prefill/sparse/fwd/head64/phase1.h"
 #include "sm100/prefill/sparse/fwd_for_small_topk/head128/phase1.h"
+#endif
 
 enum class FwdFeatures : int {
     HEAD_64,
@@ -26,6 +31,7 @@ class FwdImplBase : public ImplBase<
     FwdFeatures
 > {};
 
+#ifdef FLASH_MLA_HAS_SM90
 class Fwd_Sm90_Impl : public FwdImplBase {
     DECLARE_SUPPORTED_FEATURES(
         FwdFeatures::HEAD_64,
@@ -47,6 +53,9 @@ protected:
     }
 };
 
+#endif  // FLASH_MLA_HAS_SM90
+
+#ifdef FLASH_MLA_HAS_SM100
 class Fwd_Sm100_Head64_Impl : public FwdImplBase {
     DECLARE_SUPPORTED_FEATURES(
         FwdFeatures::HEAD_64,
@@ -98,6 +107,8 @@ protected:
     }
 };
 
+#endif  // FLASH_MLA_HAS_SM100
+
 static std::vector<at::Tensor> sparse_attn_prefill_interface(
     const at::Tensor &q,
     const at::Tensor &kv,
@@ -112,7 +123,8 @@ static std::vector<at::Tensor> sparse_attn_prefill_interface(
     Arch arch = Arch();
     bool is_sm90a = arch.is_sm90a();
     bool is_sm100f = arch.is_sm100f();
-    TORCH_CHECK(is_sm90a || is_sm100f, "Sparse Attention Forward Kernel is only supported on SM90a and SM100f architectures.");
+    bool is_sm80 = arch.is_sm80();
+    TORCH_CHECK(is_sm90a || is_sm100f || is_sm80, "Sparse Attention Forward Kernel is only supported on SM80+, SM90a, and SM100f architectures.");
 
     KU_CHECK_NDIM(q, 3);
     KU_CHECK_NDIM(kv, 3);
@@ -211,9 +223,14 @@ static std::vector<at::Tensor> sparse_attn_prefill_interface(
     }
 
     if (is_sm90a) {
+#ifdef FLASH_MLA_HAS_SM90
         Fwd_Sm90_Impl fwd_impl;
         fwd_impl.run(params, required_features);
+#else
+        TORCH_CHECK(false, "SM90 support not compiled in this build");
+#endif
     } else if (is_sm100f) {
+#ifdef FLASH_MLA_HAS_SM100
         if (h_q == 64) {
             Fwd_Sm100_Head64_Impl fwd_impl;
             fwd_impl.run(params, required_features);
@@ -235,6 +252,14 @@ static std::vector<at::Tensor> sparse_attn_prefill_interface(
         } else {
             TORCH_CHECK(false, "Unsupported h_q: ", h_q);
         }
+#endif  // FLASH_MLA_HAS_SM100
+    } else if (is_sm80) {
+        // SM86 port
+        DISPATCH_HEAD_DIM(params.d_qk, HEAD_DIM_QK, [&]() {
+            DISPATCH_BOOLEAN_FLAG(params.topk_length != nullptr, HAVE_TOPK_LENGTH, [&]() {
+                sm86::prefill::run_fwd_phase1_kernel<HEAD_DIM_QK, HAVE_TOPK_LENGTH>(params);
+            });
+        });
     } else {
         TORCH_CHECK(false, "Unsupported architecture");
     }
