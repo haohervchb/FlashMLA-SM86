@@ -35,6 +35,14 @@ struct Arch {
         return major == 9 && minor == 0;
     }
 
+    bool is_sm86() const {
+        return major == 8 && minor == 6;
+    }
+
+    bool is_sm80() const {
+        return major == 8;
+    }
+
     bool is_sm100f() const {
         return major == 10;
     }

@@ -20,6 +20,10 @@ def get_features_args():
     features_args = []
     if is_flag_set("FLASH_MLA_DISABLE_FP16"):
         features_args.append("-DFLASH_MLA_DISABLE_FP16")
+    if not is_flag_set("FLASH_MLA_DISABLE_SM90"):
+        features_args.append("-DFLASH_MLA_HAS_SM90")
+    if not is_flag_set("FLASH_MLA_DISABLE_SM100"):
+        features_args.append("-DFLASH_MLA_HAS_SM100")
     return features_args
 
 def get_arch_flags():
@@ -35,14 +39,17 @@ def get_arch_flags():
 
     DISABLE_SM100 = is_flag_set("FLASH_MLA_DISABLE_SM100")
     DISABLE_SM90 = is_flag_set("FLASH_MLA_DISABLE_SM90")
+    DISABLE_SM86 = is_flag_set("FLASH_MLA_DISABLE_SM86")
     if major < 12 or (major == 12 and minor <= 8):
-        assert DISABLE_SM100, "sm100 compilation for Flash MLA requires NVCC 12.9 or higher. Please set FLASH_MLA_DISABLE_SM100=1 to disable sm100 compilation, or update your environment."    # TODO Implement this
+        assert DISABLE_SM100, "sm100 compilation for Flash MLA requires NVCC 12.9 or higher. Please set FLASH_MLA_DISABLE_SM100=1 to disable sm100 compilation, or update your environment."
 
     arch_flags = []
     if not DISABLE_SM100:
         arch_flags.extend(["-gencode", "arch=compute_100f,code=sm_100f"])
     if not DISABLE_SM90:
         arch_flags.extend(["-gencode", "arch=compute_90a,code=sm_90a"])
+    if not DISABLE_SM86:
+        arch_flags.extend(["-gencode", "arch=compute_86,code=sm_86"])
     return arch_flags
 
 def get_nvcc_thread_args():
@@ -59,50 +66,54 @@ else:
     cxx_args = ["-O3", "-std=c++20", "-DNDEBUG", "-Wno-deprecated-declarations"]
 
 ext_modules = []
+CUDA_sources = [
+    # API
+    "csrc/api/api.cpp",
+
+    # Misc kernels for decoding (cross-architecture)
+    "csrc/smxx/decode/get_decoding_sched_meta/get_decoding_sched_meta.cu",
+    "csrc/smxx/decode/combine/combine.cu",
+]
+
+if not is_flag_set("FLASH_MLA_DISABLE_SM86"):
+    CUDA_sources += [
+        "csrc/sm86/decode/dense/instantiations/bf16.cu",
+        "csrc/sm86/decode/dense/instantiations/fp16.cu",
+    ]
+
+if not is_flag_set("FLASH_MLA_DISABLE_SM90"):
+    CUDA_sources += [
+        "csrc/sm90/decode/dense/instantiations/fp16.cu",
+        "csrc/sm90/decode/dense/instantiations/bf16.cu",
+        "csrc/sm90/decode/sparse_fp8/instantiations/model1_persistent_h64.cu",
+        "csrc/sm90/decode/sparse_fp8/instantiations/model1_persistent_h128.cu",
+        "csrc/sm90/decode/sparse_fp8/instantiations/v32_persistent_h64.cu",
+        "csrc/sm90/decode/sparse_fp8/instantiations/v32_persistent_h128.cu",
+        "csrc/sm90/prefill/sparse/fwd.cu",
+        "csrc/sm90/prefill/sparse/instantiations/phase1_k512.cu",
+        "csrc/sm90/prefill/sparse/instantiations/phase1_k512_topklen.cu",
+        "csrc/sm90/prefill/sparse/instantiations/phase1_k576.cu",
+        "csrc/sm90/prefill/sparse/instantiations/phase1_k576_topklen.cu",
+    ]
+
+if not is_flag_set("FLASH_MLA_DISABLE_SM100"):
+    CUDA_sources += [
+        "csrc/sm100/prefill/dense/fmha_cutlass_fwd_sm100.cu",
+        "csrc/sm100/prefill/dense/fmha_cutlass_bwd_sm100.cu",
+        "csrc/sm100/prefill/sparse/fwd/head64/instantiations/phase1_k512.cu",
+        "csrc/sm100/prefill/sparse/fwd/head64/instantiations/phase1_k576.cu",
+        "csrc/sm100/prefill/sparse/fwd/head128/instantiations/phase1_k512.cu",
+        "csrc/sm100/prefill/sparse/fwd/head128/instantiations/phase1_k576.cu",
+        "csrc/sm100/prefill/sparse/fwd_for_small_topk/head128/instantiations/phase1_prefill_k512.cu",
+        "csrc/sm100/decode/head64/instantiations/v32.cu",
+        "csrc/sm100/decode/head64/instantiations/model1.cu",
+        "csrc/sm100/prefill/sparse/fwd_for_small_topk/head128/instantiations/phase1_decode_k512.cu",
+    ]
+
 ext_modules.append(
     CUDAExtension(
         name="flash_mla.cuda",
-        sources=[
-            # API
-            "csrc/api/api.cpp",
-
-            # Misc kernels for decoding
-            "csrc/smxx/decode/get_decoding_sched_meta/get_decoding_sched_meta.cu",
-            "csrc/smxx/decode/combine/combine.cu",
-
-            # sm90 dense decode
-            "csrc/sm90/decode/dense/instantiations/fp16.cu",
-            "csrc/sm90/decode/dense/instantiations/bf16.cu",
-
-            # sm90 sparse decode
-            "csrc/sm90/decode/sparse_fp8/instantiations/model1_persistent_h64.cu",
-            "csrc/sm90/decode/sparse_fp8/instantiations/model1_persistent_h128.cu",
-            "csrc/sm90/decode/sparse_fp8/instantiations/v32_persistent_h64.cu",
-            "csrc/sm90/decode/sparse_fp8/instantiations/v32_persistent_h128.cu",
-
-            # sm90 sparse prefill
-            "csrc/sm90/prefill/sparse/fwd.cu",
-            "csrc/sm90/prefill/sparse/instantiations/phase1_k512.cu",
-            "csrc/sm90/prefill/sparse/instantiations/phase1_k512_topklen.cu",
-            "csrc/sm90/prefill/sparse/instantiations/phase1_k576.cu",
-            "csrc/sm90/prefill/sparse/instantiations/phase1_k576_topklen.cu",
-
-            # sm100 dense prefill & backward
-            "csrc/sm100/prefill/dense/fmha_cutlass_fwd_sm100.cu",
-            "csrc/sm100/prefill/dense/fmha_cutlass_bwd_sm100.cu",
-
-            # sm100 sparse prefill
-            "csrc/sm100/prefill/sparse/fwd/head64/instantiations/phase1_k512.cu",
-            "csrc/sm100/prefill/sparse/fwd/head64/instantiations/phase1_k576.cu",
-            "csrc/sm100/prefill/sparse/fwd/head128/instantiations/phase1_k512.cu",
-            "csrc/sm100/prefill/sparse/fwd/head128/instantiations/phase1_k576.cu",
-            "csrc/sm100/prefill/sparse/fwd_for_small_topk/head128/instantiations/phase1_prefill_k512.cu",
-
-            # sm100 sparse decode
-            "csrc/sm100/decode/head64/instantiations/v32.cu",
-            "csrc/sm100/decode/head64/instantiations/model1.cu",
-            "csrc/sm100/prefill/sparse/fwd_for_small_topk/head128/instantiations/phase1_decode_k512.cu",
-        ],
+        sources=CUDA_sources,
         extra_compile_args={
             "cxx": cxx_args + get_features_args(),
             "nvcc": [
@@ -126,6 +137,7 @@ ext_modules.append(
         include_dirs=[
             Path(this_dir) / "csrc",
             Path(this_dir) / "csrc" / "kerutils" / "include",   # TODO Remove me
+            Path(this_dir) / "csrc" / "sm86",
             Path(this_dir) / "csrc" / "sm90",
             Path(this_dir) / "csrc" / "cutlass" / "include",
             Path(this_dir) / "csrc" / "cutlass" / "tools" / "util" / "include",

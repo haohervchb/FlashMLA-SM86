@@ -6,9 +6,13 @@
 #include "common.h"
 #include "params.h"
 
-#include "sm90/decode/dense/splitkv_mla.h"
 #include "smxx/decode/get_decoding_sched_meta/get_decoding_sched_meta.h"
 #include "smxx/decode/combine/combine.h"
+
+#ifdef FLASH_MLA_HAS_SM90
+#include "sm90/decode/dense/splitkv_mla.h"
+#endif
+#include "sm86/decode/dense/splitkv_mla.h"
 
 static std::tuple<at::Tensor, at::Tensor, std::optional<at::Tensor>, std::optional<at::Tensor>>
 dense_attn_decode_interface(
@@ -24,9 +28,15 @@ dense_attn_decode_interface(
 ) {
     // Check arch
     Arch arch = Arch();
-    if (!arch.is_sm90a()) {
-        TORCH_CHECK(false, "Dense decode MLA is only supported on SM90a architecture");
+#if defined(FLASH_MLA_HAS_SM90) || defined(FLASH_MLA_HAS_SM100)
+    if (!arch.is_sm90a() && !arch.is_sm80()) {
+        TORCH_CHECK(false, "Dense decode MLA is only supported on SM80+ architecture");
     }
+#else
+    if (!arch.is_sm80()) {
+        TORCH_CHECK(false, "Dense decode MLA is only supported on SM80+ architecture");
+    }
+#endif
 
     // Check data types
     auto q_dtype = q.dtype();
@@ -173,15 +183,27 @@ dense_attn_decode_interface(
     params.stream = at::cuda::getCurrentCUDAStream().stream();
 
     if (q_dtype == torch::kBFloat16) {
-        sm90::run_flash_splitkv_mla_kernel<cutlass::bfloat16_t>(params);
+#ifdef FLASH_MLA_HAS_SM90
+        if (arch.is_sm90a()) {
+            sm90::run_flash_splitkv_mla_kernel<cutlass::bfloat16_t>(params);
+        } else
+#endif
+        {
+            sm86::run_flash_splitkv_mla_kernel<cutlass::bfloat16_t>(params);
+        }
     } else if (q_dtype == torch::kHalf) {
-#ifdef FLASH_MLA_DISABLE_FP16
-        TORCH_CHECK(false, "FlashMLA is compiled with -DFLASH_MLA_DISABLE_FP16. Please remove this flag from your environment and re-compile FlashMLA.");
-#else
-        sm90::run_flash_splitkv_mla_kernel<cutlass::half_t>(params);
+#ifndef FLASH_MLA_DISABLE_FP16
+#ifdef FLASH_MLA_HAS_SM90
+        if (arch.is_sm90a()) {
+            sm90::run_flash_splitkv_mla_kernel<cutlass::half_t>(params);
+        } else
+#endif
+        {
+            sm86::run_flash_splitkv_mla_kernel<cutlass::half_t>(params);
+        }
 #endif
     } else {
-        TORCH_CHECK(false, "Unsupported dtype for dense MLA on SM90");
+        TORCH_CHECK(false, "Unsupported dtype for dense MLA");
     }
 
     CombineParams combine_params = {

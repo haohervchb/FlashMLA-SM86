@@ -5,7 +5,11 @@
 
 using bf16 = cutlass::bfloat16_t;
 using fp8 = cutlass::float_e4m3_t;
+#if __CUDA_ARCH__ >= 900
 using transac_bar_t = cutlass::arch::ClusterTransactionBarrier;
+#else
+using transac_bar_t = cutlass::arch::ClusterBarrier;
+#endif
 using cutlass::arch::fence_view_async_shared;
 using cutlass::arch::fence_barrier_init;
 using cutlass::arch::NamedBarrier;

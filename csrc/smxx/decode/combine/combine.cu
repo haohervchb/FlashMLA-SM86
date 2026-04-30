@@ -17,7 +17,11 @@ namespace smxx::decode {
 
 template<typename ElementT, int HEAD_DIM_V, int BLOCK_SIZE_M, int MAX_SPLITS, int NUM_THREADS>
 __global__ void __launch_bounds__(NUM_THREADS)
+#if __CUDA_ARCH__ >= 900
 flash_fwd_mla_combine_kernel(__grid_constant__ const CombineParams params) {
+#else
+flash_fwd_mla_combine_kernel(const CombineParams params) {
+#endif
     // grid_shape: [batch_size*s_q, 1, h_q/BLOCK_SIZE_M]
     // Each CTA gathers the activation of some heads from one batch, do scaling & accumulation, and save the result
     static_assert(NUM_THREADS/32 == BLOCK_SIZE_M); // The number of warps == block_size_m
@@ -56,7 +60,9 @@ flash_fwd_mla_combine_kernel(__grid_constant__ const CombineParams params) {
     __shared__ float smem_buf[BLOCK_SIZE_M][MAX_SPLITS];
 
     // Wait for the previous kernel (the MLA kernel) to finish
+#if __CUDA_ARCH__ >= 900
     cudaGridDependencySynchronize();
+#endif
 
     // Prefetch
     static_assert(HEAD_DIM_V % (32*4) == 0);
@@ -187,7 +193,7 @@ flash_fwd_mla_combine_kernel(__grid_constant__ const CombineParams params) {
 
 template<typename ElementT>
 void run_flash_mla_combine_kernel(CombineParams &params) {
-    static constexpr int HEAD_DIM_V = 512;  // Since only this head dimension is supported by Flash MLA
+    static constexpr int HEAD_DIM_V = 512;
     FLASH_ASSERT(params.d_v == HEAD_DIM_V);
     MLA_NUM_SPLITS_SWITCH(params.num_sm_parts, NUM_SPLITS, [&] {
         constexpr int BLOCK_SIZE_M = 8;
@@ -195,19 +201,28 @@ void run_flash_mla_combine_kernel(CombineParams &params) {
         constexpr size_t smem_size = BLOCK_SIZE_M*(NUM_SPLITS+1)*sizeof(float);
         auto combine_kernel = &flash_fwd_mla_combine_kernel<ElementT, HEAD_DIM_V, BLOCK_SIZE_M, NUM_SPLITS, NUM_THREADS>;
         CHECK_CUDA(cudaFuncSetAttribute(combine_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
-        // Use cudaLaunchKernelEx to enable PDL (Programmatic Dependent Launch)
-        cudaLaunchAttribute attribute[1];
-        attribute[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
-        attribute[0].val.programmaticStreamSerializationAllowed = 1;
-        cudaLaunchConfig_t combine_kernel_config = {
-            dim3(params.b * params.s_q, 1, ku::ceil_div(params.h_q, BLOCK_SIZE_M)),
-            dim3(NUM_THREADS, 1, 1),
-            0,
-            params.stream,
-            attribute,
-            1
-        };
-        CHECK_CUDA(cudaLaunchKernelEx(&combine_kernel_config, combine_kernel, params));
+        // Use PDL on SM90+, regular launch on SM86
+        int device;
+        cudaGetDevice(&device);
+        cudaDeviceProp prop;
+        cudaGetDeviceProperties(&prop, device);
+        if (prop.major >= 9) {
+            cudaLaunchAttribute attribute[1];
+            attribute[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+            attribute[0].val.programmaticStreamSerializationAllowed = 1;
+            cudaLaunchConfig_t combine_kernel_config = {
+                dim3(params.b * params.s_q, 1, ku::ceil_div(params.h_q, BLOCK_SIZE_M)),
+                dim3(NUM_THREADS, 1, 1),
+                0,
+                params.stream,
+                attribute,
+                1
+            };
+            CHECK_CUDA(cudaLaunchKernelEx(&combine_kernel_config, combine_kernel, params));
+        } else {
+            combine_kernel<<<dim3(params.b * params.s_q, 1, ku::ceil_div(params.h_q, BLOCK_SIZE_M)),
+                            dim3(NUM_THREADS), smem_size, params.stream>>>(params);
+        }
     });
     CHECK_CUDA_KERNEL_LAUNCH();
 }
